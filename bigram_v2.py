@@ -4,13 +4,16 @@ from torch.nn import functional as F
 
 # hyperparams
 batch_size = 32
-block_size = 8
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-3
+block_size = 128
+max_iters = 5000
+eval_interval = 500
+learning_rate = 5e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32
+n_embd = 192
+n_head = 6
+n_layer = 6
+dropout = 0.2
 # --------------------
 
 torch.manual_seed(1337)
@@ -66,6 +69,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x)   # (B,T,C)
@@ -74,6 +79,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * C**-0.5 # (B, T, C) @ (B, C, T) ---> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf')) # (B,T,T)
         wei = F.softmax(wei, dim=-1) # (B,T,T)
+        wei = self.dropout(wei)
         # Perform weighted aggregation of the values
         v = self.value(x) # (B,T,C)
         out = wei @ v # (B,T,T) @ (B,T,C) -> (B,T,C)
@@ -86,10 +92,11 @@ class MultiHeadedAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(num_heads * head_size, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 class FeedForward(nn.Module):
@@ -99,7 +106,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd)
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
         )
     
     def forward(self, x):
@@ -132,12 +140,14 @@ class BigramLanguageModel(nn.Module):
         # self.sa_head = Head(n_embd)
         # self.sa_heads = MultiHeadedAttention(4, n_embd//4) # i.e 4 heads of 8-dimensional self-attention
         # self.ffwd = FeedForward(n_embd)
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            nn.LayerNorm(n_embd),
-        )
+        # self.blocks = nn.Sequential(
+        #     Block(n_embd, n_head=4),
+        #     Block(n_embd, n_head=4),
+        #     Block(n_embd, n_head=4),
+        #     nn.LayerNorm(n_embd),
+        # )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -151,6 +161,7 @@ class BigramLanguageModel(nn.Module):
         # x = self.sa_heads(x) # Apply self attention
         # x = self.ffwd(x) # (B,T,C)
         x = self.blocks(x) # (B,T,C)
+        x = self.ln_f(x) # (B, t, C)
         logits = self.lm_head(x) # (B,T,vocab_size)
         # We need to reshape the logits to (B,C,T) since that's how pytorch expects them
         if targets is None:
